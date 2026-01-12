@@ -16,6 +16,99 @@ except ImportError:
     NUMBA_AVAILABLE = False
 
 
+# ============== OUTPUT FORMATTING & CLEANING ==============
+
+def euclidean_distance(a, b):
+    """Compute Euclidean distance between two 2D points."""
+    ax, ay = int(a[0]), int(a[1])
+    bx, by = int(b[0]), int(b[1])
+    return math.hypot(ax - bx, ay - by)
+
+
+def compute_pairwise_distance(coords):
+    """Compute sum of all pairwise distances between points in group."""
+    pair_sum = 0.0
+    for i in range(len(coords)):
+        for j in range(i + 1, len(coords)):
+            pair_sum += euclidean_distance(coords[i], coords[j])
+    return pair_sum
+
+
+def compute_spawn_distance(coords):
+    """Compute sum of distances from origin (spawn) for all points."""
+    return sum(math.hypot(float(c[0]), float(c[1])) for c in coords)
+
+
+def canonicalize_coords(coords):
+    """Sort coordinates for consistent ordering and deduplication."""
+    return sorted(coords, key=lambda c: (int(c[0]), int(c[1])))
+
+
+def format_group(coords, spawn_dist, pairwise_dist):
+    """Format a group result as a clean string."""
+    coords = canonicalize_coords(coords)
+    coord_str = ' '.join([f'({int(c[0])}, {int(c[1])})' for c in coords])
+    return f'{coord_str} spawn:{spawn_dist:.2f} spread:{pairwise_dist:.2f}'
+
+
+def get_group_signature(coords):
+    """Get a hashable signature for deduplication."""
+    coords = canonicalize_coords(coords)
+    return tuple((int(c[0]), int(c[1])) for c in coords)
+
+
+def get_output_paths(base_path):
+    """Generate spawn and spread output paths from a base path.
+    
+    e.g., 'output3Mon.txt' -> ('output3Mon_spawn.txt', 'output3Mon_spread.txt')
+    """
+    if '.' in base_path:
+        name, ext = base_path.rsplit('.', 1)
+        return f"{name}_spawn.{ext}", f"{name}_spread.{ext}"
+    else:
+        return f"{base_path}_spawn", f"{base_path}_spread"
+
+
+def dedup_and_write_results(all_results, base_output_path, group_type="groups"):
+    """Deduplicate results and write two sorted files (spawn and spread).
+    
+    Args:
+        all_results: List of (coords, spawn_dist, pairwise_dist) tuples
+        base_output_path: Base path for output files (will generate _spawn and _spread variants)
+        group_type: Label for print messages ("triplets" or "quads")
+    """
+    # Deduplication - always performed
+    print("Deduplicating results...")
+    seen = {}
+    for coords, spawn_dist, pairwise_dist in all_results:
+        sig = get_group_signature(coords)
+        if sig not in seen:
+            seen[sig] = (coords, spawn_dist, pairwise_dist)
+        # For duplicates, we already have this signature, skip
+    all_results = list(seen.values())
+    print(f"After dedup: {len(all_results)} unique {group_type}")
+    
+    # Get output paths
+    spawn_path, spread_path = get_output_paths(base_output_path)
+    
+    # Write spawn-sorted file
+    print(f"Writing {spawn_path} (sorted by distance from spawn)...")
+    sorted_by_spawn = sorted(all_results, key=lambda x: x[1])
+    with open(spawn_path, 'w') as f:
+        for coords, spawn_dist, pairwise_dist in sorted_by_spawn:
+            f.write(format_group(coords, spawn_dist, pairwise_dist) + '\n')
+    
+    # Write spread-sorted file
+    print(f"Writing {spread_path} (sorted by group spread - tighter groups first)...")
+    sorted_by_spread = sorted(all_results, key=lambda x: x[2])
+    with open(spread_path, 'w') as f:
+        for coords, spawn_dist, pairwise_dist in sorted_by_spread:
+            f.write(format_group(coords, spawn_dist, pairwise_dist) + '\n')
+    
+    print(f"Completed: Found {len(all_results)} {group_type} total")
+    return len(all_results)
+
+
 def check_group(coords, r2):
     """Check if all points in group are within radius of each other."""
     for i in range(len(coords)):
@@ -164,14 +257,14 @@ def _worker_find_groups_3(args):
             j = neigh_indices[a_idx]
             for b_idx in range(a_idx + 1, len(neigh_indices)):
                 k = neigh_indices[b_idx]
-                coords = [places[i], places[j], places[k]]
+                # Convert to plain tuples for clean output
+                coords = [(int(places[i][0]), int(places[i][1])),
+                          (int(places[j][0]), int(places[j][1])),
+                          (int(places[k][0]), int(places[k][1]))]
                 if check_group(coords, r2):
-                    dist = (
-                        math.sqrt(float(places[i][0])**2 + float(places[i][1])**2) +
-                        math.sqrt(float(places[j][0])**2 + float(places[j][1])**2) +
-                        math.sqrt(float(places[k][0])**2 + float(places[k][1])**2)
-                    )
-                    results.append((coords, dist))
+                    spawn_dist = compute_spawn_distance(coords)
+                    pairwise_dist = compute_pairwise_distance(coords)
+                    results.append((coords, spawn_dist, pairwise_dist))
         
         # Update shared progress counter periodically
         local_count += 1
@@ -215,16 +308,16 @@ def _worker_find_groups_4(args):
             for b_idx in range(a_idx + 1, L):
                 k = neigh_indices[b_idx]
                 for c_idx in range(b_idx + 1, L):
-                    l = neigh_indices[c_idx]
-                    coords = [places[i], places[j], places[k], places[l]]
+                    m = neigh_indices[c_idx]
+                    # Convert to plain tuples for clean output
+                    coords = [(int(places[i][0]), int(places[i][1])),
+                              (int(places[j][0]), int(places[j][1])),
+                              (int(places[k][0]), int(places[k][1])),
+                              (int(places[m][0]), int(places[m][1]))]
                     if check_group(coords, r2):
-                        dist = (
-                            math.sqrt(float(places[i][0])**2 + float(places[i][1])**2) +
-                            math.sqrt(float(places[j][0])**2 + float(places[j][1])**2) +
-                            math.sqrt(float(places[k][0])**2 + float(places[k][1])**2) +
-                            math.sqrt(float(places[l][0])**2 + float(places[l][1])**2)
-                        )
-                        results.append((coords, dist))
+                        spawn_dist = compute_spawn_distance(coords)
+                        pairwise_dist = compute_pairwise_distance(coords)
+                        results.append((coords, spawn_dist, pairwise_dist))
         
         # Update shared progress counter periodically
         local_count += 1
@@ -264,7 +357,12 @@ def _progress_monitor(progress_counter, found_counter, total, stop_event, label=
 
 
 def find_groups_3_global_parallel(places, memmap_path, radius, output_path, leafsize, num_workers=None):
-    """Parallel version of find_groups_3_global using multiple processes."""
+    """Parallel version of find_groups_3_global using multiple processes.
+    
+    Results are always deduplicated and written to two files:
+    - {output_path}_spawn.txt (sorted by distance from origin)
+    - {output_path}_spread.txt (sorted by pairwise distance, tighter groups first)
+    """
     if num_workers is None:
         num_workers = max(1, mp.cpu_count() - 1)
     
@@ -292,27 +390,27 @@ def find_groups_3_global_parallel(places, memmap_path, radius, output_path, leaf
     monitor_thread.daemon = True
     monitor_thread.start()
     
-    found = 0
+    all_results = []
     
     try:
-        with open(output_path, 'w') as f:
-            with mp.Pool(processes=num_workers, initializer=_init_worker, initargs=(progress_counter, found_counter)) as pool:
-                for results, count, worker_id in pool.imap_unordered(_worker_find_groups_3, chunks):
-                    # Write results
-                    for coords, dist in results:
-                        f.write(f"{(coords, dist)}\n")
-                    found += len(results)
+        with mp.Pool(processes=num_workers, initializer=_init_worker, initargs=(progress_counter, found_counter)) as pool:
+            for results, count, worker_id in pool.imap_unordered(_worker_find_groups_3, chunks):
+                all_results.extend(results)
     finally:
         stop_event.set()
         monitor_thread.join(timeout=1.0)
     
-    # Add any results tracked via shared counter
-    found = max(found, found_counter.value)
-    print(f"Completed: Found {found} triplet groups total")
+    # Deduplicate and write both sorted files
+    dedup_and_write_results(all_results, output_path, "triplets")
 
 
 def find_groups_4_global_parallel(places, memmap_path, radius, output_path, leafsize, num_workers=None):
-    """Parallel version of find_groups_4_global using multiple processes."""
+    """Parallel version of find_groups_4_global using multiple processes.
+    
+    Results are always deduplicated and written to two files:
+    - {output_path}_spawn.txt (sorted by distance from origin)
+    - {output_path}_spread.txt (sorted by pairwise distance, tighter groups first)
+    """
     if num_workers is None:
         num_workers = max(1, mp.cpu_count() - 1)
     
@@ -339,81 +437,94 @@ def find_groups_4_global_parallel(places, memmap_path, radius, output_path, leaf
     monitor_thread.daemon = True
     monitor_thread.start()
     
-    found = 0
+    all_results = []
     
     try:
-        with open(output_path, 'w') as f:
-            with mp.Pool(processes=num_workers, initializer=_init_worker, initargs=(progress_counter, found_counter)) as pool:
-                for results, count, worker_id in pool.imap_unordered(_worker_find_groups_4, chunks):
-                    for coords, dist in results:
-                        f.write(f"{(coords, dist)}\n")
-                    found += len(results)
+        with mp.Pool(processes=num_workers, initializer=_init_worker, initargs=(progress_counter, found_counter)) as pool:
+            for results, count, worker_id in pool.imap_unordered(_worker_find_groups_4, chunks):
+                all_results.extend(results)
     finally:
         stop_event.set()
         monitor_thread.join(timeout=1.0)
     
-    found = max(found, found_counter.value)
-    print(f"Completed: Found {found} quad groups total")
+    # Deduplicate and write both sorted files
+    dedup_and_write_results(all_results, output_path, "quads")
 
 
 # ============== SINGLE-THREADED FUNCTIONS (for --single-threaded option) ==============
 
 def find_groups_3_global(places, tree, radius, output_path):
+    """Single-threaded version for finding triplets.
+    
+    Results are always deduplicated and written to two files:
+    - {output_path}_spawn.txt (sorted by distance from origin)
+    - {output_path}_spread.txt (sorted by pairwise distance, tighter groups first)
+    """
     r2 = radius * radius
-    found = 0
     totalPlaces = len(places)
-    with open(output_path, "a") as f:
-        for i in range(totalPlaces):
-            if i % 100000 == 0 and i > 0:
-                percentage = (i / totalPlaces) * 100
-                print(f"{percentage:.2f}% searched - Found {found} groups")
+    all_results = []
+    
+    for i in range(totalPlaces):
+        if i % 100000 == 0 and i > 0:
+            percentage = (i / totalPlaces) * 100
+            print(f"{percentage:.2f}% searched - Found {len(all_results)} groups")
 
-            neighbors = tree.query_ball_point(places[i], r=radius)
-            neigh_indices = [idx for idx in neighbors if idx > i]
-            neigh_indices.sort()
-            for a_idx in range(len(neigh_indices)):
-                j = neigh_indices[a_idx]
-                for b_idx in range(a_idx + 1, len(neigh_indices)):
-                    k = neigh_indices[b_idx]
-                    if check_group([places[i], places[j], places[k]], r2):
-                        dist = (
-                            math.sqrt(float(places[i][0]) ** 2 + float(places[i][1]) ** 2) +
-                            math.sqrt(float(places[j][0]) ** 2 + float(places[j][1]) ** 2) +
-                            math.sqrt(float(places[k][0]) ** 2 + float(places[k][1]) ** 2)
-                        )
-                        f.write(f"{([places[i], places[j], places[k]], dist)}\n")
-                        found += 1
+        neighbors = tree.query_ball_point(places[i], r=radius)
+        neigh_indices = [idx for idx in neighbors if idx > i]
+        neigh_indices.sort()
+        for a_idx in range(len(neigh_indices)):
+            j = neigh_indices[a_idx]
+            for b_idx in range(a_idx + 1, len(neigh_indices)):
+                k = neigh_indices[b_idx]
+                coords = [(int(places[i][0]), int(places[i][1])),
+                          (int(places[j][0]), int(places[j][1])),
+                          (int(places[k][0]), int(places[k][1]))]
+                if check_group(coords, r2):
+                    spawn_dist = compute_spawn_distance(coords)
+                    pairwise_dist = compute_pairwise_distance(coords)
+                    all_results.append((coords, spawn_dist, pairwise_dist))
+    
+    # Deduplicate and write both sorted files
+    dedup_and_write_results(all_results, output_path, "triplets")
 
 
 def find_groups_4_global(places, tree, radius, output_path):
+    """Single-threaded version for finding quads.
+    
+    Results are always deduplicated and written to two files:
+    - {output_path}_spawn.txt (sorted by distance from origin)
+    - {output_path}_spread.txt (sorted by pairwise distance, tighter groups first)
+    """
     r2 = radius * radius
-    found = 0
     totalPlaces = len(places)
-    with open(output_path, "a") as f:
-        for i in range(totalPlaces):
-            if i % 100000 == 0 and i > 0:
-                percentage = (i / totalPlaces) * 100
-                print(f"{percentage:.2f}% searched - Found {found} groups")
+    all_results = []
+    
+    for i in range(totalPlaces):
+        if i % 100000 == 0 and i > 0:
+            percentage = (i / totalPlaces) * 100
+            print(f"{percentage:.2f}% searched - Found {len(all_results)} groups")
 
-            neighbors = tree.query_ball_point(places[i], r=radius)
-            neigh_indices = [idx for idx in neighbors if idx > i]
-            neigh_indices.sort()
-            L = len(neigh_indices)
-            for a_idx in range(L):
-                j = neigh_indices[a_idx]
-                for b_idx in range(a_idx + 1, L):
-                    k = neigh_indices[b_idx]
-                    for c_idx in range(b_idx + 1, L):
-                        l = neigh_indices[c_idx]
-                        if check_group([places[i], places[j], places[k], places[l]], r2):
-                            dist = (
-                                math.sqrt(float(places[i][0]) ** 2 + float(places[i][1]) ** 2) +
-                                math.sqrt(float(places[j][0]) ** 2 + float(places[j][1]) ** 2) +
-                                math.sqrt(float(places[k][0]) ** 2 + float(places[k][1]) ** 2) +
-                                math.sqrt(float(places[l][0]) ** 2 + float(places[l][1]) ** 2)
-                            )
-                            f.write(f"{([places[i], places[j], places[k], places[l]], dist)}\n")
-                            found += 1
+        neighbors = tree.query_ball_point(places[i], r=radius)
+        neigh_indices = [idx for idx in neighbors if idx > i]
+        neigh_indices.sort()
+        L = len(neigh_indices)
+        for a_idx in range(L):
+            j = neigh_indices[a_idx]
+            for b_idx in range(a_idx + 1, L):
+                k = neigh_indices[b_idx]
+                for c_idx in range(b_idx + 1, L):
+                    m = neigh_indices[c_idx]
+                    coords = [(int(places[i][0]), int(places[i][1])),
+                              (int(places[j][0]), int(places[j][1])),
+                              (int(places[k][0]), int(places[k][1])),
+                              (int(places[m][0]), int(places[m][1]))]
+                    if check_group(coords, r2):
+                        spawn_dist = compute_spawn_distance(coords)
+                        pairwise_dist = compute_pairwise_distance(coords)
+                        all_results.append((coords, spawn_dist, pairwise_dist))
+    
+    # Deduplicate and write both sorted files
+    dedup_and_write_results(all_results, output_path, "quads")
 
 
 # ============== INTERACTIVE CONFIG ==============
@@ -461,9 +572,13 @@ def interactive_config():
     out3 = None
     out4 = None
     if find_triplets:
-        out3 = prompt_input("Output file for triplets", "output3Mon.txt")
+        out3 = prompt_input("Output base name for triplets", "output3Mon.txt")
+        spawn_path, spread_path = get_output_paths(out3)
+        print(f"    -> Will create: {spawn_path} and {spread_path}")
     if find_quads:
-        out4 = prompt_input("Output file for quads", "output4Mon.txt")
+        out4 = prompt_input("Output base name for quads", "output4Mon.txt")
+        spawn_path, spread_path = get_output_paths(out4)
+        print(f"    -> Will create: {spawn_path} and {spread_path}")
     
     print()
     print("--- Performance Settings ---")
@@ -486,10 +601,20 @@ def interactive_config():
     print("  Configuration Summary:")
     print(f"    Input file:      {input_file}")
     print(f"    Radius:          {radius}")
-    print(f"    Find triplets:   {find_triplets}" + (f" -> {out3}" if find_triplets else ""))
-    print(f"    Find quads:      {find_quads}" + (f" -> {out4}" if find_quads else ""))
+    if find_triplets:
+        s, p = get_output_paths(out3)
+        print(f"    Triplets:        {s}, {p}")
+    else:
+        print(f"    Triplets:        skipped")
+    if find_quads:
+        s, p = get_output_paths(out4)
+        print(f"    Quads:           {s}, {p}")
+    else:
+        print(f"    Quads:           skipped")
     print(f"    Parallel:        {use_parallel}" + (f" ({num_workers} workers)" if use_parallel else ""))
     print(f"    Leafsize:        {'auto' if leafsize == 0 else leafsize}")
+    print("  Note: Results are always deduplicated and output to two files")
+    print("        (one sorted by spawn distance, one by group spread)")
     print("=" * 60)
     print()
     
@@ -528,13 +653,17 @@ def format_duration(seconds):
 def main():
     start_time = time.time()
     
-    parser = argparse.ArgumentParser(description="Find groups of huts/monuments within a radius")
+    parser = argparse.ArgumentParser(
+        description="Find groups of huts/monuments within a radius. "
+                    "Results are always deduplicated and output to two files per group type "
+                    "(one sorted by spawn distance, one by group spread)."
+    )
     parser.add_argument("--input", default=None, help="Path to input file (text)")
     parser.add_argument("--memmap", default=None, help="Path to memmap file (will be created)")
     parser.add_argument("--radius", type=int, default=None, help="Search radius")
     parser.add_argument("--leafsize", type=int, default=None, help="KDTree leafsize (0 = auto based on dataset size)")
-    parser.add_argument("--out3", default=None, help="Output text for groups of 3")
-    parser.add_argument("--out4", default=None, help="Output text for groups of 4")
+    parser.add_argument("--out3", default=None, help="Base output name for groups of 3 (creates _spawn and _spread files)")
+    parser.add_argument("--out4", default=None, help="Base output name for groups of 4 (creates _spawn and _spread files)")
     parser.add_argument("--skip3", action="store_true", help="Skip groups of 3")
     parser.add_argument("--skip4", action="store_true", help="Skip groups of 4")
     parser.add_argument("--workers", type=int, default=None, help="Number of worker processes (0 = auto)")
@@ -584,6 +713,14 @@ def main():
             print(f"Using {num_workers} worker processes")
         else:
             print("Running in single-threaded mode")
+        
+        # Show output files that will be created
+        if out3_path:
+            s, p = get_output_paths(out3_path)
+            print(f"Triplet outputs: {s}, {p}")
+        if out4_path:
+            s, p = get_output_paths(out4_path)
+            print(f"Quad outputs: {s}, {p}")
 
     places = parse_to_memmap(input_file, memmap_file)
     
@@ -592,10 +729,19 @@ def main():
         leafsize = compute_auto_leafsize(len(places))
         print(f"Auto leafsize: {leafsize} (based on {len(places):,} places)")
 
-    if out3_path and os.path.exists(out3_path):
-        os.remove(out3_path)
-    if out4_path and os.path.exists(out4_path):
-        os.remove(out4_path)
+    # Clean up old output files
+    if out3_path:
+        spawn_path, spread_path = get_output_paths(out3_path)
+        if os.path.exists(spawn_path):
+            os.remove(spawn_path)
+        if os.path.exists(spread_path):
+            os.remove(spread_path)
+    if out4_path:
+        spawn_path, spread_path = get_output_paths(out4_path)
+        if os.path.exists(spawn_path):
+            os.remove(spawn_path)
+        if os.path.exists(spread_path):
+            os.remove(spread_path)
 
     if not use_parallel:
         tree = build_tree(places, leafsize)
