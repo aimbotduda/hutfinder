@@ -1,12 +1,14 @@
 import argparse
 import math
+import mmap
 import os
+import re
 import sys
 import threading
 import time
 import tempfile
 import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -266,39 +268,242 @@ def find_center(coords):
     return (x, z)
 
 
-def parse_to_memmap(input_path, memmap_path):
-    print("Reading and parsing file of all huts/monuments")
-    total_lines = 0
-    total_records = 0
-    with open(input_path) as f:
-        for line in f:
-            total_lines += 1
-            if "->(" in line:
-                total_records += 1
-    print(f"Lines: {total_lines}, records: {total_records}")
+def _estimate_record_count(file_path, sample_size=10_000_000):
+    """Estimate total record count by sampling the file."""
+    file_size = os.path.getsize(file_path)
+    
+    # Read a sample to estimate records per byte
+    with open(file_path, 'rb') as f:
+        sample = f.read(min(sample_size, file_size))
+    
+    sample_records = sample.count(b'->(')
+    if sample_records == 0:
+        return 0
+    
+    # Extrapolate
+    bytes_per_record = len(sample) / sample_records
+    estimated_total = int(file_size / bytes_per_record * 1.05)  # 5% buffer
+    return estimated_total
 
-    places_mm = np.memmap(memmap_path, dtype=np.int32, mode='w+', shape=(total_records, 2))
 
-    written = 0
-    processed = 0
-    with open(input_path) as f:
-        for line in f:
-            processed += 1
-            if "->(" in line:
-                coords = line.split("->(")[1].split(")reg")[0]
-                x_str, z_str = coords.split(",")
-                places_mm[written, 0] = int(x_str)
-                places_mm[written, 1] = int(z_str)
-                written += 1
-                if written % 5_000_000 == 0:
-                    percentage = (processed / max(total_lines, 1)) * 100
-                    print(f"{percentage:.2f}% read - {written} records")
+def _parse_chunk(chunk_data):
+    """Parse a chunk of bytes and return coordinates as numpy array."""
+    # Pre-compiled regex for speed
+    pattern = re.compile(rb'->\((-?\d+),(-?\d+)\)')
+    matches = pattern.findall(chunk_data)
+    
+    if not matches:
+        return np.empty((0, 2), dtype=np.int32)
+    
+    # Convert to numpy array in one operation
+    coords = np.array([(int(x), int(z)) for x, z in matches], dtype=np.int32)
+    return coords
 
+
+def _parse_chunk_for_pool(args):
+    """Worker function for parallel parsing."""
+    chunk_data, chunk_id = args
+    return _parse_chunk(chunk_data), chunk_id
+
+
+def parse_to_memmap(input_path, memmap_path, num_parse_workers=None):
+    """
+    Fast file parsing with multiple optimizations:
+    - Single pass over the file (estimates count from sample)
+    - Memory-mapped file reading for speed
+    - Regex-based batch extraction
+    - Optional parallel chunk parsing
+    - Batched writes to output memmap
+    """
+    print("Reading and parsing file of all huts/monuments (fast mode)")
+    start_time = time.time()
+    
+    file_size = os.path.getsize(input_path)
+    print(f"File size: {file_size / (1024**3):.2f} GB")
+    
+    # Estimate record count
+    print("Estimating record count...")
+    estimated_records = _estimate_record_count(input_path)
+    print(f"Estimated records: ~{estimated_records:,}")
+    
+    if estimated_records == 0:
+        print("No records found in file!")
+        return np.empty((0, 2), dtype=np.int32)
+    
+    # Determine parsing strategy based on file size and available cores
+    if num_parse_workers is None:
+        num_parse_workers = max(1, mp.cpu_count() - 1)
+    
+    # For very large files, use parallel parsing
+    use_parallel = file_size > 100_000_000 and num_parse_workers > 1  # >100MB
+    
+    # Pre-compile regex
+    pattern = re.compile(rb'->\((-?\d+),(-?\d+)\)')
+    
+    # Chunk size for reading (64MB chunks work well for I/O)
+    chunk_size = 64 * 1024 * 1024
+    
+    # We'll collect all coordinates and write to memmap at the end
+    # This is actually faster than writing during parsing for large files
+    all_coords = []
+    total_found = 0
+    bytes_read = 0
+    last_progress = 0
+    
+    print(f"Parsing with chunk size: {chunk_size // (1024*1024)}MB" + 
+          (f", {num_parse_workers} workers" if use_parallel else ", single-threaded"))
+    
+    with open(input_path, 'rb') as f:
+        # Memory-map the file for faster reading
+        try:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            use_mmap = True
+        except:
+            # Fallback if mmap fails
+            use_mmap = False
+            mm = f
+        
+        leftover = b''
+        
+        if use_parallel and use_mmap:
+            # Parallel parsing: read chunks and parse in parallel
+            chunks_to_parse = []
+            
+            while True:
+                if use_mmap:
+                    chunk = mm.read(chunk_size)
+                else:
+                    chunk = f.read(chunk_size)
+                
+                if not chunk:
+                    # Process any leftover
+                    if leftover:
+                        coords = _parse_chunk(leftover)
+                        if len(coords) > 0:
+                            all_coords.append(coords)
+                            total_found += len(coords)
+                    break
+                
+                bytes_read += len(chunk)
+                
+                # Combine with leftover from previous chunk
+                data = leftover + chunk
+                
+                # Find last newline to avoid splitting records
+                last_newline = data.rfind(b'\n')
+                if last_newline == -1:
+                    leftover = data
+                    continue
+                
+                # Split at last newline
+                to_parse = data[:last_newline + 1]
+                leftover = data[last_newline + 1:]
+                
+                chunks_to_parse.append((to_parse, len(chunks_to_parse)))
+                
+                # Parse in batches to limit memory
+                if len(chunks_to_parse) >= num_parse_workers * 2:
+                    with ProcessPoolExecutor(max_workers=num_parse_workers) as executor:
+                        results = list(executor.map(_parse_chunk_for_pool, chunks_to_parse))
+                    
+                    for coords, _ in sorted(results, key=lambda x: x[1]):
+                        if len(coords) > 0:
+                            all_coords.append(coords)
+                            total_found += len(coords)
+                    
+                    chunks_to_parse = []
+                
+                # Progress update
+                progress = int(bytes_read / file_size * 100)
+                if progress >= last_progress + 5:
+                    elapsed = time.time() - start_time
+                    speed_mb = bytes_read / (1024**2) / max(elapsed, 0.001)
+                    print(f"  {progress}% read ({total_found:,} records found, {speed_mb:.1f} MB/s)")
+                    last_progress = progress
+            
+            # Process remaining chunks
+            if chunks_to_parse:
+                with ProcessPoolExecutor(max_workers=num_parse_workers) as executor:
+                    results = list(executor.map(_parse_chunk_for_pool, chunks_to_parse))
+                
+                for coords, _ in sorted(results, key=lambda x: x[1]):
+                    if len(coords) > 0:
+                        all_coords.append(coords)
+                        total_found += len(coords)
+        
+        else:
+            # Single-threaded parsing (simpler, still fast)
+            while True:
+                if use_mmap:
+                    chunk = mm.read(chunk_size)
+                else:
+                    chunk = f.read(chunk_size)
+                
+                if not chunk:
+                    if leftover:
+                        coords = _parse_chunk(leftover)
+                        if len(coords) > 0:
+                            all_coords.append(coords)
+                            total_found += len(coords)
+                    break
+                
+                bytes_read += len(chunk)
+                data = leftover + chunk
+                
+                last_newline = data.rfind(b'\n')
+                if last_newline == -1:
+                    leftover = data
+                    continue
+                
+                to_parse = data[:last_newline + 1]
+                leftover = data[last_newline + 1:]
+                
+                coords = _parse_chunk(to_parse)
+                if len(coords) > 0:
+                    all_coords.append(coords)
+                    total_found += len(coords)
+                
+                progress = int(bytes_read / file_size * 100)
+                if progress >= last_progress + 5:
+                    elapsed = time.time() - start_time
+                    speed_mb = bytes_read / (1024**2) / max(elapsed, 0.001)
+                    print(f"  {progress}% read ({total_found:,} records found, {speed_mb:.1f} MB/s)")
+                    last_progress = progress
+        
+        if use_mmap:
+            mm.close()
+    
+    parse_time = time.time() - start_time
+    print(f"Parsing complete: {total_found:,} records in {parse_time:.2f}s")
+    
+    if total_found == 0:
+        print("No records found!")
+        return np.empty((0, 2), dtype=np.int32)
+    
+    # Concatenate all coordinate arrays
+    print("Concatenating arrays...")
+    concat_start = time.time()
+    all_places = np.concatenate(all_coords, axis=0)
+    del all_coords  # Free memory
+    print(f"Concatenation: {time.time() - concat_start:.2f}s")
+    
+    # Write to memmap
+    print(f"Writing {len(all_places):,} records to memmap...")
+    write_start = time.time()
+    places_mm = np.memmap(memmap_path, dtype=np.int32, mode='w+', shape=all_places.shape)
+    places_mm[:] = all_places
     places_mm.flush()
     del places_mm
-    places = np.memmap(memmap_path, dtype=np.int32, mode='r', shape=(total_records, 2))
-    print("Parsed file")
-    print(f"Found {len(places)} places")
+    del all_places
+    print(f"Write complete: {time.time() - write_start:.2f}s")
+    
+    # Reopen as read-only
+    places = np.memmap(memmap_path, dtype=np.int32, mode='r', shape=(total_found, 2))
+    
+    total_time = time.time() - start_time
+    print(f"Total parsing time: {total_time:.2f}s ({file_size / (1024**3) / total_time:.2f} GB/s)")
+    print(f"Found {len(places):,} places")
+    
     return places
 
 
